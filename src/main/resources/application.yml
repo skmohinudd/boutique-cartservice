@@ -1,0 +1,47 @@
+spring:
+  application:
+    name: cartservice
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      connect-timeout: 2s
+      timeout: 2s
+
+server:
+  port: ${SERVER_PORT:8083}
+  shutdown: graceful
+
+clients:
+  user:
+    base-url: ${USER_SERVICE_URL:http://localhost:8082}
+  product:
+    base-url: ${PRODUCT_SERVICE_URL:http://localhost:8080}
+  inventory:
+    base-url: ${INVENTORY_SERVICE_URL:http://localhost:8081}
+
+cart:
+  ttl: ${CART_TTL:30d}
+  maximum-quantity: ${CART_MAXIMUM_QUANTITY:99}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+
+springdoc:
+  api-docs:
+    enabled: ${OPENAPI_ENABLED:true}
+    path: /v3/api-docs
+
+  swagger-ui:
+    enabled: ${SWAGGER_ENABLED:true}
+    path: /swagger-ui.html
