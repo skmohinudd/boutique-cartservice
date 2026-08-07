@@ -12,6 +12,12 @@ spring:
 server:
   port: ${SERVER_PORT:8083}
   shutdown: graceful
+  tomcat:
+    threads:
+      max: ${SERVER_TOMCAT_MAX_THREADS:80}
+      min-spare: ${SERVER_TOMCAT_MIN_SPARE_THREADS:10}
+    accept-count: ${SERVER_TOMCAT_ACCEPT_COUNT:200}
+    max-connections: ${SERVER_TOMCAT_MAX_CONNECTIONS:2000}
 
 clients:
   user:

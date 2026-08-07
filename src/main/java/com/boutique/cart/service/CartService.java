@@ -37,7 +37,9 @@ public class CartService {
 
     public CartResponse addItem(UUID userId, AddCartItemRequest request) {
         userClient.requireActiveUser(userId);
-        productClient.requireActiveProduct(request.productId());
+
+        ProductClient.ProductSnapshot product =
+                productClient.requireActiveProduct(request.productId());
 
         InventoryClient.InventorySnapshot inventory =
                 inventoryClient.getInventory(request.productId());
@@ -71,12 +73,83 @@ public class CartService {
             );
         }
 
-        return getCart(userId);
+        // Reuse the Product and Inventory responses already fetched above.
+        // Previously addItem() called getCart(), which repeated User + Product +
+        // Inventory downstream calls and doubled fan-out for a one-item cart.
+        return buildCart(
+                userId,
+                request.productId(),
+                product,
+                inventory
+        );
     }
 
     public CartResponse getCart(UUID userId) {
         userClient.requireActiveUser(userId);
+        return buildCart(userId, null, null, null);
+    }
 
+    public CartResponse updateItem(
+            UUID userId,
+            UUID productId,
+            UpdateCartItemRequest request
+    ) {
+        userClient.requireActiveUser(userId);
+
+        ProductClient.ProductSnapshot product =
+                productClient.requireActiveProduct(productId);
+
+        Map<UUID, Integer> items = cartRepository.findItems(userId);
+        if (!items.containsKey(productId)) {
+            throw new ResourceNotFoundException(
+                    "Product is not present in the cart: " + productId
+            );
+        }
+
+        InventoryClient.InventorySnapshot inventory =
+                inventoryClient.getInventory(productId);
+
+        if (request.quantity() > inventory.sellableQuantity()) {
+            throw new InvalidCartOperationException(
+                    "Requested quantity exceeds sellable inventory."
+            );
+        }
+
+        cartRepository.setQuantity(userId, productId, request.quantity());
+
+        return buildCart(
+                userId,
+                productId,
+                product,
+                inventory
+        );
+    }
+
+    public CartResponse removeItem(UUID userId, UUID productId) {
+        userClient.requireActiveUser(userId);
+
+        if (!cartRepository.removeItem(userId, productId)) {
+            throw new ResourceNotFoundException(
+                    "Product is not present in the cart: " + productId
+            );
+        }
+
+        // User has already been validated above; do not call getCart() and
+        // validate the same user a second time.
+        return buildCart(userId, null, null, null);
+    }
+
+    public void clearCart(UUID userId) {
+        userClient.requireActiveUser(userId);
+        cartRepository.clear(userId);
+    }
+
+    private CartResponse buildCart(
+            UUID userId,
+            UUID reusableProductId,
+            ProductClient.ProductSnapshot reusableProduct,
+            InventoryClient.InventorySnapshot reusableInventory
+    ) {
         Map<UUID, Integer> storedItems = cartRepository.findItems(userId);
         List<CartItemResponse> items = new ArrayList<>();
         BigDecimal subtotal = BigDecimal.ZERO;
@@ -84,10 +157,21 @@ public class CartService {
         String currency = null;
 
         for (Map.Entry<UUID, Integer> entry : storedItems.entrySet()) {
-            ProductClient.ProductSnapshot product =
-                    productClient.requireActiveProduct(entry.getKey());
-            InventoryClient.InventorySnapshot inventory =
-                    inventoryClient.getInventory(entry.getKey());
+            UUID productId = entry.getKey();
+
+            ProductClient.ProductSnapshot product;
+            InventoryClient.InventorySnapshot inventory;
+
+            if (reusableProductId != null
+                    && reusableProductId.equals(productId)
+                    && reusableProduct != null
+                    && reusableInventory != null) {
+                product = reusableProduct;
+                inventory = reusableInventory;
+            } else {
+                product = productClient.requireActiveProduct(productId);
+                inventory = inventoryClient.getInventory(productId);
+            }
 
             if (currency != null && !currency.equals(product.currency())) {
                 throw new InvalidCartOperationException(
@@ -122,52 +206,7 @@ public class CartService {
                 List.copyOf(items),
                 totalItems,
                 subtotal,
-                currency == null ? "USD" : currency
+                currency == null ? "INR" : currency
         );
-    }
-
-    public CartResponse updateItem(
-            UUID userId,
-            UUID productId,
-            UpdateCartItemRequest request
-    ) {
-        userClient.requireActiveUser(userId);
-        productClient.requireActiveProduct(productId);
-
-        Map<UUID, Integer> items = cartRepository.findItems(userId);
-        if (!items.containsKey(productId)) {
-            throw new ResourceNotFoundException(
-                    "Product is not present in the cart: " + productId
-            );
-        }
-
-        InventoryClient.InventorySnapshot inventory =
-                inventoryClient.getInventory(productId);
-
-        if (request.quantity() > inventory.sellableQuantity()) {
-            throw new InvalidCartOperationException(
-                    "Requested quantity exceeds sellable inventory."
-            );
-        }
-
-        cartRepository.setQuantity(userId, productId, request.quantity());
-        return getCart(userId);
-    }
-
-    public CartResponse removeItem(UUID userId, UUID productId) {
-        userClient.requireActiveUser(userId);
-
-        if (!cartRepository.removeItem(userId, productId)) {
-            throw new ResourceNotFoundException(
-                    "Product is not present in the cart: " + productId
-            );
-        }
-
-        return getCart(userId);
-    }
-
-    public void clearCart(UUID userId) {
-        userClient.requireActiveUser(userId);
-        cartRepository.clear(userId);
     }
 }
