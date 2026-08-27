@@ -10,7 +10,7 @@ on:
       - main
   workflow_dispatch:
 
-# Never allow two Cart deployments to modify the same Helm release together.
+# Never allow two Cart deployments to modify the same Helm release together...
 concurrency:
   group: cartservice-${{ github.ref }}
   cancel-in-progress: false
