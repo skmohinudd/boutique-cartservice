@@ -76,7 +76,9 @@
             <name>Boutique Nexus Releases</name>
             <url>http://44.199.205.21:8081/repository/maven-releases/</url>
         </repository>
-    </distributionManagement><build>
+    </distributionManagement>
+
+    <build>
         <plugins>
             <plugin>
                 <groupId>org.springframework.boot</groupId>

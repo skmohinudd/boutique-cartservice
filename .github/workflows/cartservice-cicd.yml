@@ -1,0 +1,533 @@
+name: Cart Service CI/CD
+
+# PR validates code. Main builds, publishes and deploys.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Never allow two Cart deployments to modify the same Helm release together.
+concurrency:
+  group: cartservice-${{ github.ref }}
+  cancel-in-progress: false
+
+# id-token is required for GitHub OIDC authentication with AWS.
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  SERVICE_NAME: cartservice
+
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "663130434910"
+  ECR_REPOSITORY: boutique-cartservice
+
+  EKS_CLUSTER_NAME: boutique-dev-eks
+  K8S_NAMESPACE: boutique
+  K8S_DEPLOYMENT: cartservice
+  K8S_SERVICE: cartservice
+
+  HELM_RELEASE: cartservice-dev
+  PLATFORM_REPOSITORY: skmohinudd/boutique-platform-infra
+  HELM_CHART_PATH: boutique-platform-infra/helm/cartservice
+
+  SONAR_PROJECT_KEY: boutique-cartservice
+  SONAR_PROJECT_NAME: Boutique Cart Service
+
+
+jobs:
+
+  # ==========================================================
+  # PULL REQUEST VALIDATION
+  # Tests and Sonar only. Nothing is published or deployed.
+  # ==========================================================
+
+  pr-validation:
+    name: Validate Cart Pull Request
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Prepare Maven
+        run: chmod +x mvnw
+
+      - name: Run tests
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          if ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            clean test > /tmp/test.log 2>&1
+          then
+            echo "Maven tests passed"
+          else
+            echo "Maven tests failed"
+            tail -n 80 /tmp/test.log
+            exit 1
+          fi
+
+      - name: Run SonarQube analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          if ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar \
+            -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+            -Dsonar.projectName="$SONAR_PROJECT_NAME" \
+            -Dsonar.host.url="$SONAR_HOST_URL" \
+            -Dsonar.token="$SONAR_TOKEN" \
+            > /tmp/sonar.log 2>&1
+          then
+            echo "SonarQube analysis completed"
+          else
+            echo "SonarQube analysis failed"
+            tail -n 80 /tmp/sonar.log
+            exit 1
+          fi
+
+
+  # ==========================================================
+  # MAIN BRANCH
+  # Test -> Build -> Sonar -> Nexus -> ECR -> Helm -> EKS
+  # ==========================================================
+
+  deploy-main:
+    name: Build and Deploy Cart to EKS
+
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch')
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      # One version identifies the JAR, Nexus artifact, ECR image and EKS deployment.
+      - name: Generate application version
+        run: |
+          chmod +x mvnw
+          APP_VERSION="1.0.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          echo "Application version: $APP_VERSION"
+
+      - name: Set Maven version
+        run: |
+          ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            versions:set \
+            -DnewVersion="$APP_VERSION" \
+            -DgenerateBackupPoms=false
+
+      - name: Run tests through Nexus
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          if ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            clean test > /tmp/test.log 2>&1
+          then
+            echo "Maven tests passed"
+          else
+            echo "Maven tests failed"
+            tail -n 80 /tmp/test.log
+            exit 1
+          fi
+
+      - name: Build application JAR
+        run: |
+          if ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            package -DskipTests > /tmp/build.log 2>&1
+          then
+            JAR_NAME="${SERVICE_NAME}-${APP_VERSION}.jar"
+            test -f "target/$JAR_NAME"
+            echo "JAR_NAME=$JAR_NAME" >> "$GITHUB_ENV"
+            echo "JAR built: $JAR_NAME"
+          else
+            echo "JAR build failed"
+            tail -n 80 /tmp/build.log
+            exit 1
+          fi
+
+      - name: Run SonarQube analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          if ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar \
+            -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+            -Dsonar.projectName="$SONAR_PROJECT_NAME" \
+            -Dsonar.projectVersion="$APP_VERSION" \
+            -Dsonar.host.url="$SONAR_HOST_URL" \
+            -Dsonar.token="$SONAR_TOKEN" \
+            > /tmp/sonar.log 2>&1
+          then
+            echo "SonarQube analysis completed"
+          else
+            echo "SonarQube analysis failed"
+            tail -n 80 /tmp/sonar.log
+            exit 1
+          fi
+
+      - name: Publish JAR to Nexus
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          if ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            deploy -DskipTests > /tmp/nexus.log 2>&1
+          then
+            echo "Nexus artifact published: $JAR_NAME"
+          else
+            echo "Nexus publication failed"
+            tail -n 80 /tmp/nexus.log
+            exit 1
+          fi
+
+
+      # ======================================================
+      # AWS / ECR
+      # GitHub OIDC assumes the shared backend deployment role.
+      # ======================================================
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: cart-${{ github.run_id }}
+          allowed-account-ids: "663130434910"
+
+      - name: Validate AWS and ECR
+        run: |
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          test "$ACCOUNT" = "$AWS_ACCOUNT_ID"
+
+          aws ecr describe-repositories \
+            --repository-names "$ECR_REPOSITORY" \
+            --region "$AWS_REGION" \
+            > /dev/null
+
+          echo "AWS authentication and ECR repository verified"
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE_REPOSITORY="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+          IMAGE_URI="${IMAGE_REPOSITORY}:${APP_VERSION}"
+
+          echo "IMAGE_REPOSITORY=$IMAGE_REPOSITORY" >> "$GITHUB_ENV"
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+
+          if docker build \
+            --quiet \
+            --label "org.opencontainers.image.version=$APP_VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -t "$IMAGE_URI" . > /tmp/docker.log 2>&1
+          then
+            echo "Docker image built: $IMAGE_URI"
+          else
+            echo "Docker build failed"
+            tail -n 80 /tmp/docker.log
+            exit 1
+          fi
+
+      # Trivy will be added between Docker build and ECR push later.
+
+      - name: Push Docker image to ECR
+        run: |
+          if docker push --quiet "$IMAGE_URI" > /tmp/ecr.log 2>&1
+          then
+            echo "ECR image pushed: $IMAGE_URI"
+          else
+            echo "ECR push failed"
+            tail -n 80 /tmp/ecr.log
+            exit 1
+          fi
+
+      - name: Validate ECR image
+        run: |
+          IMAGE_DIGEST="$(aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$APP_VERSION" \
+            --region "$AWS_REGION" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+
+          test -n "$IMAGE_DIGEST"
+          test "$IMAGE_DIGEST" != "None"
+
+          echo "IMAGE_DIGEST=$IMAGE_DIGEST" >> "$GITHUB_ENV"
+          echo "ECR image verified"
+
+
+      # ======================================================
+      # HELM / EKS
+      # ======================================================
+
+      - name: Setup Kubernetes tools
+        uses: azure/setup-kubectl@v5.1.0
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v5.0.0
+
+      - name: Checkout platform repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLATFORM_REPOSITORY }}
+          path: boutique-platform-infra
+          persist-credentials: false
+
+      # Render the exact manifests before changing the cluster.
+      - name: Validate Helm chart
+        run: |
+          test -f "$HELM_CHART_PATH/Chart.yaml"
+          test -f "$HELM_CHART_PATH/values.yaml"
+
+          helm lint "$HELM_CHART_PATH" > /dev/null
+
+          helm template "$HELM_RELEASE" "$HELM_CHART_PATH" \
+            --namespace "$K8S_NAMESPACE" \
+            --set image.repository="$IMAGE_REPOSITORY" \
+            --set image.tag="$APP_VERSION" \
+            > /tmp/cart-rendered.yaml
+
+          test -s /tmp/cart-rendered.yaml
+
+          echo "Helm chart validated"
+
+      - name: Configure EKS access
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME" \
+            > /dev/null
+
+          test "$(kubectl auth can-i get deployments \
+            -n "$K8S_NAMESPACE")" = "yes"
+
+          test "$(kubectl auth can-i patch deployments \
+            -n "$K8S_NAMESPACE")" = "yes"
+
+          echo "EKS access verified"
+
+      # Cart requires Redis plus the backend services it calls.
+      - name: Validate Cart dependencies
+        run: |
+          kubectl get service redis \
+            -n "$K8S_NAMESPACE" > /dev/null
+
+          kubectl get service userservice \
+            -n "$K8S_NAMESPACE" > /dev/null
+
+          kubectl get service productcatalogservice \
+            -n "$K8S_NAMESPACE" > /dev/null
+
+          kubectl get service inventoryservice \
+            -n "$K8S_NAMESPACE" > /dev/null
+
+          echo "Cart runtime dependencies verified"
+
+      - name: Show current deployment
+        run: |
+          CURRENT_IMAGE="$(kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' \
+            2>/dev/null || true)"
+
+          echo "Previous image: ${CURRENT_IMAGE:-not-deployed}"
+
+
+      # Helm changes the image tag, causing Kubernetes to create a
+      # new ReplicaSet. Existing Pods remain until new Pods are ready.
+      - name: Deploy Cart with Helm
+        run: |
+          if helm upgrade --install \
+            "$HELM_RELEASE" \
+            "$HELM_CHART_PATH" \
+            --namespace "$K8S_NAMESPACE" \
+            --set image.repository="$IMAGE_REPOSITORY" \
+            --set image.tag="$APP_VERSION" \
+            --rollback-on-failure \
+            --cleanup-on-fail \
+            --history-max 5 \
+            --wait \
+            --timeout 5m \
+            > /tmp/helm.log 2>&1
+          then
+            echo "Helm deployment completed"
+          else
+            echo "Helm deployment failed"
+            tail -n 100 /tmp/helm.log
+
+            kubectl get pods \
+              -n "$K8S_NAMESPACE" \
+              -l app="$SERVICE_NAME" \
+              -o wide || true
+
+            exit 1
+          fi
+
+      - name: Validate Kubernetes rollout
+        run: |
+          kubectl rollout status \
+            deployment/"$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            --timeout=180s \
+            > /dev/null
+
+          echo "Kubernetes rollout completed"
+
+      # Ensure EKS actually runs the image produced by this workflow.
+      - name: Validate deployed image
+        run: |
+          DEPLOYED_IMAGE="$(kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')"
+
+          if [[ "$DEPLOYED_IMAGE" != "$IMAGE_URI" ]]; then
+            echo "Expected: $IMAGE_URI"
+            echo "Running : $DEPLOYED_IMAGE"
+            exit 1
+          fi
+
+          echo "Deployed image verified"
+
+      - name: Validate ready replicas
+        run: |
+          READY="$(kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.status.readyReplicas}')"
+
+          DESIRED="$(kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.spec.replicas}')"
+
+          if [[ "${READY:-0}" != "$DESIRED" ]]; then
+            echo "Ready replicas: ${READY:-0}/${DESIRED}"
+            kubectl get pods \
+              -n "$K8S_NAMESPACE" \
+              -l app="$SERVICE_NAME" \
+              -o wide
+            exit 1
+          fi
+
+          echo "Ready replicas: $READY/$DESIRED"
+
+      # Test the real Kubernetes Service -> Pod request path.
+      - name: Validate application health
+        run: |
+          TEST_POD="cart-health-${GITHUB_RUN_ID}"
+
+          cleanup() {
+            kubectl delete pod "$TEST_POD" \
+              -n "$K8S_NAMESPACE" \
+              --ignore-not-found \
+              > /dev/null 2>&1 || true
+          }
+
+          trap cleanup EXIT
+
+          kubectl run "$TEST_POD" \
+            --restart=Never \
+            --image=curlimages/curl \
+            -n "$K8S_NAMESPACE" \
+            --command -- \
+            curl \
+              --fail \
+              --silent \
+              --retry 5 \
+              --retry-delay 3 \
+              "http://${K8S_SERVICE}:8083/actuator/health" \
+            > /dev/null
+
+          kubectl wait \
+            --for=jsonpath='{.status.phase}'=Succeeded \
+            pod/"$TEST_POD" \
+            -n "$K8S_NAMESPACE" \
+            --timeout=90s \
+            > /dev/null
+
+          HEALTH="$(kubectl logs "$TEST_POD" -n "$K8S_NAMESPACE")"
+
+          echo "$HEALTH" | grep -q '"status":"UP"'
+
+          echo "Cart application health: UP"
+
+      - name: Deployment summary
+        run: |
+          HELM_REVISION="$(helm history "$HELM_RELEASE" \
+            -n "$K8S_NAMESPACE" \
+            -o json | jq -r '.[-1].revision')"
+
+          echo "----------------------------------------"
+          echo "Cart deployment completed"
+          echo "----------------------------------------"
+          echo "Version        : $APP_VERSION"
+          echo "Nexus artifact : $JAR_NAME"
+          echo "ECR image      : $IMAGE_URI"
+          echo "ECR digest     : $IMAGE_DIGEST"
+          echo "Helm release   : $HELM_RELEASE"
+          echo "Helm revision  : $HELM_REVISION"
+          echo "EKS deployment : $K8S_DEPLOYMENT"
+          echo "Health         : UP"
+          echo "----------------------------------------"
